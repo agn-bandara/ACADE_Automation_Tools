@@ -1,0 +1,1415 @@
+
+Sub ProcessTerminalConnectionTable()
+    On Error GoTo ErrorHandler
+    
+    ' Declare variables
+    Dim acDoc As AcadDocument
+    Dim acTable As AcadTable
+    Dim i As Long, j As Long, k As Long
+    Dim progressFrm As New progressForm
+    Dim titleText As String
+    Dim plcText As String
+    Dim resultTextArr() As String
+    Dim cellText As String
+    Dim rowsToDelete As New Collection
+    Dim mergeStart As Long
+    Dim mergeEnd As Long
+    Dim headerRow As Long
+    Dim titleRow As Long
+    Dim pickPoint(0 To 2) As Double
+    
+    ' Get the current document
+    Set acDoc = ThisDrawing
+    
+    ' Show progress form
+    progressFrm.show vbModeless
+    UpdateProgress progressFrm, "Starting process...", 0
+    
+    ' Show clear instructions
+    MsgBox "IMPORTANT: You will now be asked to select the terminal connection table." & vbCrLf & vbCrLf & _
+           "• Click on the TABLE BORDER (the outline of the table)" & vbCrLf & _
+           "• Do NOT click on text inside the table", _
+           vbInformation, "Select Terminal Table"
+    
+    ' Prompt user to select the table
+    On Error Resume Next
+    acDoc.Utility.GetEntity acTable, pickPoint, "Select the terminal connection table (click on table border): "
+    
+    If Err.Number <> 0 Then
+        MsgBox "Selection canceled or failed.", vbExclamation, "Selection Error"
+        Unload progressFrm
+        Exit Sub
+    End If
+    On Error GoTo ErrorHandler
+    
+    If acTable Is Nothing Then
+        MsgBox "No entity selected. Exiting macro.", vbExclamation, "Selection Error"
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Check if the selected entity is a table
+    If Not TypeOf acTable Is AcadTable Then
+        MsgBox "The selected object is not a table." & vbCrLf & vbCrLf & _
+               "Please run the macro again and click on the TABLE BORDER (outline), not on text or other objects.", _
+               vbExclamation, "Invalid Selection"
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Check table structure
+    If acTable.Columns < 4 Then
+        MsgBox "Table does not have the correct structure. It needs at least 4 columns.", vbExclamation
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Verify column headers
+    headerRow = 1 ' Assuming header is in row 1
+    titleRow = 0  ' Assuming title is in row 0
+    
+    UpdateProgress progressFrm, "Verifying table structure...", 5
+    
+    If acTable.GetText(headerRow, 0) <> "TRM. NO." Or _
+       acTable.GetText(headerRow, 1) <> "JUMPER" Or _
+       acTable.GetText(headerRow, 2) <> "WIRE" Or _
+       acTable.GetText(headerRow, 3) <> "DEVICE" Then
+        MsgBox "Table does not have the correct column headers. Expected: TRM.NO., JUMPER, WIRE, DEVICE", vbExclamation
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Get title text (terminal tagstrip number)
+    titleText = acTable.GetText(titleRow, 0)
+    resultTextArr = Split(titleText, "-")
+    plcText = resultTextArr(UBound(resultTextArr))
+    
+    ' 1. Add two new columns for DESCRIPTION and PLC IO first
+    UpdateProgress progressFrm, "Adding new columns...", 10
+    
+    On Error Resume Next
+    acTable.InsertColumns acTable.Columns, acTable.GetColumnWidth(acTable.Columns - 1), 2
+    acTable.SetText headerRow, acTable.Columns - 2, "DESCRIPTION"
+    ' Changed header name to "PLC IO" (with a space)
+    acTable.SetText headerRow, acTable.Columns - 1, "PLC IO"
+    On Error GoTo 0
+    
+    ' 2. Keep only rows with numeric values in TRM.NO.
+    UpdateProgress progressFrm, "Processing table...", 20
+    
+    For i = 2 To acTable.rows - 1 ' Start from row 2 (skip title and header rows)
+        cellText = Trim(acTable.GetText(i, 0)) ' TRM.NO. column
+        
+        ' Check if cell contains only numeric value using a different approach
+        Dim shouldKeepRow As Boolean
+        shouldKeepRow = True
+        
+        ' Only attempt numeric check if there's actual content
+        If cellText <> "" Then
+            On Error Resume Next
+            Dim testValue As Double
+            testValue = CDbl(cellText)
+            ' If there was an error converting to number, we should delete this row
+            If Err.Number <> 0 Then
+                shouldKeepRow = False
+                Err.Clear
+            End If
+            On Error GoTo 0
+            
+            If Not shouldKeepRow Then
+                ' Add non-numeric rows to the deletion list
+                rowsToDelete.Add i
+            End If
+        End If
+        
+        UpdateProgress progressFrm, "Checking rows for numeric values: " & i & " of " & acTable.rows, _
+                        20 + (10 * i / acTable.rows)
+    Next i
+    
+    ' Delete rows with non-numeric TRM.NO. values (start from the bottom to not mess up indices)
+    Dim deletionCount As Long
+    deletionCount = rowsToDelete.Count
+    
+    If deletionCount > 0 Then
+        For i = deletionCount To 1 Step -1
+            On Error Resume Next
+            acTable.DeleteRows rowsToDelete(i), 1
+            On Error GoTo 0
+            
+            UpdateProgress progressFrm, "Deleting non-numeric rows: " & (deletionCount - i + 1) & " of " & deletionCount, _
+                            30 + (10 * (deletionCount - i + 1) / deletionCount)
+        Next i
+    End If
+    
+    ' 3. Process device matching title text
+    UpdateProgress progressFrm, "Processing device matching title...", 40
+    
+    For i = 2 To acTable.rows - 1
+        cellText = Trim(acTable.GetText(i, 3)) ' DEVICE column
+
+        If (cellText = titleText) Or (cellText = plcText) Then
+            ' Clear WIRE and DEVICE but keep TRM.NO. and JUMPER
+            acTable.SetText i, 2, "" ' WIRE
+            acTable.SetText i, 3, "" ' DEVICE
+        End If
+        
+        UpdateProgress progressFrm, "Processing device matching: " & i & " of " & acTable.rows, _
+                        40 + (10 * i / acTable.rows)
+    Next i
+    
+    ' 4. Move data from second row of merged cells to first row
+    UpdateProgress progressFrm, "Moving data in merged cells...", 50
+    
+    i = 2
+    While i < acTable.rows - 1
+        ' Check if current row is the start of merged cells in TRM.NO. column
+        If acTable.GetText(i, 0) <> "" Then
+            ' Find potential merge range
+            mergeStart = i
+            mergeEnd = i
+            
+            ' Look ahead for merged cells (empty TRM.NO. cells)
+            For j = i + 1 To acTable.rows - 1
+                If acTable.GetText(j, 0) = "" And acTable.GetText(j, 1) = "" Then
+                    ' Likely part of merged cells
+                    mergeEnd = j
+                Else
+                    Exit For
+                End If
+            Next j
+            
+            ' If we found merged cells
+            If mergeEnd > mergeStart Then
+                ' Process all rows in the merged range
+                For j = mergeStart + 1 To mergeEnd
+                    ' For each column (starting from WIRE which is column 2)
+                    For k = 2 To acTable.Columns - 1
+                        ' Move data if exists in secondary merged row but not in first row
+                        If acTable.GetText(j, k) <> "" And acTable.GetText(mergeStart, k) = "" Then
+                            acTable.SetText mergeStart, k, acTable.GetText(j, k)
+                            acTable.SetText j, k, ""
+                        End If
+                    Next k
+                Next j
+                
+                ' Skip to next non-merged row
+                i = mergeEnd + 1
+            Else
+                i = i + 1
+            End If
+        Else
+            i = i + 1
+        End If
+        
+        UpdateProgress progressFrm, "Processing merged cells: " & i & " of " & acTable.rows, _
+                        50 + (10 * i / acTable.rows)
+    Wend
+    
+    ' 5. Simplified merging approach - merge rows in pairs (3-4, 5-6, 7-8, etc.)
+    UpdateProgress progressFrm, "Merging rows in columns...", 60
+    
+    ' Start from row 3 (first data row after headers)
+    Dim startRow As Long
+    startRow = 2  ' Adjust if your table has different structure
+    
+    ' Continue until we can't make any more pairs
+    While startRow + 1 < acTable.rows
+        ' For each column (starting from WIRE which is column 2)
+        For k = 2 To acTable.Columns - 1
+            ' Skip TRM. NO. and JUMPER columns (0 and 1)
+            On Error Resume Next
+            ' Merge this column for two rows at a time
+            acTable.MergeCells startRow, startRow + 1, k, k
+            If Err.Number <> 0 Then
+                ' Just clear any error and continue
+                Err.Clear
+            End If
+            On Error GoTo 0
+        Next k
+        
+        ' Move to the next pair of rows
+        startRow = startRow + 2
+        
+        UpdateProgress progressFrm, "Merging rows in columns: " & startRow & " of " & acTable.rows, _
+                    60 + (20 * startRow / acTable.rows)
+    Wend
+        
+    ' 6. Change cell height of the header row to 60
+    UpdateProgress progressFrm, "Adjusting header row height...", 80
+    
+    On Error Resume Next
+    acTable.SetRowHeight headerRow, 60
+    On Error GoTo 0
+    
+    ' 7. Change text direction of the header row to 270 degrees
+    UpdateProgress progressFrm, "Changing text direction of header row...", 90
+    
+    On Error Resume Next
+    For j = 0 To acTable.Columns - 1
+        ' In AutoCAD, text rotation is specified in degrees
+        acTable.SetTextRotation headerRow, j, acDegrees270
+    Next j
+    On Error GoTo 0
+
+    ' 8. Process PLC IO column based on Wire column values
+    ' The Wire cell is expected to be in the format "XX-YY" where XX should match plcText.
+    ' If so, extract YY, place it in the PLC IO column (last column), and clear both the Wire and Device cells.
+    UpdateProgress progressFrm, "Processing PLC IO column...", 95
+    
+    Dim parts() As String
+    Dim currentWireText As String
+    Dim colPLCIO As Long
+    colPLCIO = acTable.Columns - 1  ' PLC IO column is the last column
+    
+    For i = 2 To acTable.rows - 1
+        currentWireText = Trim(acTable.GetText(i, 2)) ' Wire column
+        
+        If InStr(currentWireText, "-") > 0 Then
+            parts = Split(currentWireText, "-")
+            ' Check if the left part equals plcText (ignoring case)
+            If UCase(Trim(parts(0))) = UCase(plcText) Then
+                ' Insert the YY component (right of the dash) into the PLC IO column
+                acTable.SetText i, colPLCIO, Trim(parts(1))
+            End If
+        End If
+        If Trim(acTable.GetText(i, 3)) = plcText Then
+            ' Clear the Wire cell
+            acTable.SetText i, 2, ""
+            ' Clear the Device cell as well
+            acTable.SetText i, 3, ""
+        End If
+        UpdateProgress progressFrm, "Processing PLC IO: " & i & " of " & acTable.rows, _
+                        95 + (5 * i / acTable.rows)
+    Next i
+    
+    Dim rslt
+    rslt = MsgBox("Do you want to load PLC Descriptions from another drawing", vbYesNo, "PLC Terminal Converter")
+    If rslt = vbNo Then
+        ' Set description column width to 160 units
+        newTable.SetColumnWidth acTable.Columns - 2, 160
+        
+        ' Reset USERI5 flag when done
+        acDoc.SetVariable "USERI5", 0
+        
+        ' Set active table to the new table
+        newTable.Update
+        
+        ' Zoom to see the new table
+        acDoc.Application.ZoomExtents
+        
+        UpdateProgress progressFrm, "Process completed", 100
+        
+        ' Finish
+        MsgBox "New Terminal Connection Table created successfully 20 units to the right of the original.", vbInformation
+        Unload progressFrm
+        Exit Sub
+    End If
+
+' 9. Process PLC IO and Description columns using LISP function
+    UpdateProgress progressFrm, "Processing PLC IO and Description using LISP...", 95
+    
+    ' Create CSV filename based on titleText
+    Dim csvFilename As String
+    csvFilename = titleText
+    If csvFilename = "" Then
+        csvFilename = "PLCData"
+    End If
+    
+    ' Get the temp folder path
+    Dim tempFolder As String
+    tempFolder = Environ("TEMP")
+    Dim csvPath As String
+    csvPath = tempFolder & "\" & csvFilename & ".csv"
+    
+SelectCSV:
+    ' Delete existing CSV file if it exists
+    On Error Resume Next
+    If Dir(csvPath) <> "" Then
+        Kill csvPath
+    End If
+    On Error GoTo ErrorHandler
+    
+    ' Reset USERI5 flag before calling LISP function
+    acDoc.SetVariable "USERI5", 0
+    
+    ' Call the getDwgPLCAttr LISP function
+    acDoc.SendCommand "getDwgPLCAttr" & vbCr & csvFilename & vbCr
+    
+    ' Wait for initial grace period (1 second)
+    Dim startWait As Date
+    startWait = Now
+    Do While DateDiff("s", startWait, Now) < 1
+        DoEvents
+    Loop
+    
+    ' Wait for LISP function to complete by checking USERI5 flag
+    Dim maxWaitTime As Long
+    maxWaitTime = 15 ' seconds
+    Dim startTime As Date
+    startTime = Now
+    Dim flagStatus As Integer
+    
+    UpdateProgress progressFrm, "Waiting for LISP function to complete...", 96
+    
+    Do While DateDiff("s", startTime, Now) < maxWaitTime
+        ' Check the USERI5 flag
+        flagStatus = acDoc.GetVariable("USERI5")
+        
+        ' 1 = success, -1 = error, 0 = still processing
+        If flagStatus = 1 Then
+            ' Success - break out of the waiting loop
+            Exit Do
+        ElseIf flagStatus = -1 Then
+            ' Error condition from LISP
+            MsgBox "The LISP function encountered an error or found no PLC blocks.", vbExclamation
+            Unload progressFrm
+            Exit Sub
+        End If
+        
+        ' Short delay to prevent tight loop
+        startWait = Now
+        Do While DateDiff("s", startWait, Now) < 0.2 ' 0.2 second delay
+            DoEvents
+        Loop
+    Loop
+    
+    ' Check if we timed out
+    If flagStatus <> 1 Then
+        MsgBox "Error: The LISP function did not complete within the timeout period.", vbExclamation
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Verify CSV file exists
+    If Dir(csvPath) = "" Then
+        MsgBox "Error: CSV file was not created properly.", vbExclamation
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Wait an additional short period to ensure file is completely written and released
+    startWait = Now
+    Do While DateDiff("s", startWait, Now) < 0.5 ' Half second grace period
+        DoEvents
+    Loop
+    
+    ' Use Dictionary object to store attribute data
+    Dim plcDict As Object
+    Set plcDict = CreateObject("Scripting.Dictionary")
+    Dim tagValue As String
+    tagValue = ""
+    
+    ' Read CSV file
+    Dim fileNum As Integer
+    fileNum = FreeFile
+    
+    ' Use error handling to make sure file is accessible
+    On Error Resume Next
+    Open csvPath For Input As #fileNum
+    If Err.Number <> 0 Then
+        MsgBox "Error accessing CSV file: " & Err.Description, vbExclamation
+        Unload progressFrm
+        Exit Sub
+    End If
+    On Error GoTo ErrorHandler
+    
+    Dim headerSkipped As Boolean
+    headerSkipped = False
+    Dim line As String
+    Dim csvparts() As String
+    
+    ' Parse the CSV line by line
+    UpdateProgress progressFrm, "Reading CSV data...", 96.5
+    
+    Do Until EOF(fileNum)
+        Line Input #fileNum, line
+        
+        ' Skip header row
+        If Not headerSkipped Then
+            headerSkipped = True
+        Else
+            ' Parse CSV properly, handling quoted fields
+            Dim fieldPos As Long
+            Dim fieldStart As Long
+            Dim inQuotes As Boolean
+            Dim fieldCount As Long
+            
+            fieldCount = 0
+            ReDim csvparts(2) ' We expect 3 fields (0-2)
+            fieldStart = 1
+            fieldPos = 1
+            inQuotes = False
+            
+            Do While fieldPos <= Len(line)
+                Dim currChar As String
+                currChar = Mid(line, fieldPos, 1)
+                
+                If currChar = """" Then
+                    ' Toggle quote state
+                    inQuotes = Not inQuotes
+                ElseIf currChar = "," And Not inQuotes Then
+                    ' Found a field delimiter
+                    Dim fieldText As String
+                    fieldText = Mid(line, fieldStart, fieldPos - fieldStart)
+                    
+                    ' Remove quotes if present
+                    If Left(fieldText, 1) = """" And Right(fieldText, 1) = """" Then
+                        fieldText = Mid(fieldText, 2, Len(fieldText) - 2)
+                    End If
+                    
+                    ' Store field
+                    If fieldCount <= 2 Then
+                        csvparts(fieldCount) = fieldText
+                    End If
+                    
+                    fieldCount = fieldCount + 1
+                    fieldStart = fieldPos + 1
+                End If
+                
+                fieldPos = fieldPos + 1
+            Loop
+            
+            ' Get the last field
+            If fieldStart <= Len(line) Then
+                fieldText = Mid(line, fieldStart)
+                
+                ' Remove quotes if present
+                If Left(fieldText, 1) = """" And Right(fieldText, 1) = """" Then
+                    fieldText = Mid(fieldText, 2, Len(fieldText) - 2)
+                End If
+                
+                ' Store field
+                If fieldCount <= 2 Then
+                    csvparts(fieldCount) = fieldText
+                End If
+            End If
+            
+            ' Process the fields if we have all three
+            If UBound(csvparts) >= 2 Then
+                Dim blockName As String
+                Dim attrName As String
+                Dim attrValue As String
+                
+                blockName = Trim(csvparts(0))
+                attrName = Trim(csvparts(1))
+                attrValue = Trim(csvparts(2))
+                
+                ' Check if this is the TAG attribute
+                If attrName = "TAG" Then
+                    tagValue = attrValue
+                End If
+                
+                ' Store in dictionary
+                If Not plcDict.Exists(attrName) Then
+                    plcDict.Add attrName, attrValue
+                End If
+            End If
+        End If
+    Loop
+    
+    Close #fileNum
+    
+    ' Verify TAG attribute matches plcText
+    If tagValue <> plcText Then
+        MsgBox "Error: The TAG value in the CSV file (" & tagValue & ") does not match the expected value (" & plcText & ")." & vbCrLf & _
+               "Please select the correct drawing and try again.", vbExclamation
+        
+        ' Delete CSV file
+        On Error Resume Next
+        Kill csvPath
+        On Error GoTo ErrorHandler
+        GoTo SelectCSV
+    End If
+    
+    ' Process table rows
+    Dim descColIndex As Long
+    Dim plcIOColIndex As Long
+    
+    descColIndex = acTable.Columns - 2 ' DESCRIPTION column
+    plcIOColIndex = acTable.Columns - 1 ' PLC IO column
+    
+    ' Set description column width to 200 units
+    acTable.SetColumnWidth descColIndex, 160
+    
+    UpdateProgress progressFrm, "Updating table with PLC data...", 97
+    
+    ' Dictionary to track which attributes have been processed
+    Dim processedAttr As Object
+    Set processedAttr = CreateObject("Scripting.Dictionary")
+    
+    For i = 2 To acTable.rows - 1
+        Dim currentPLCIO As String
+        currentPLCIO = Trim(acTable.GetText(i, plcIOColIndex))
+        Dim commonTerminal As Boolean
+        commonTerminal = False
+        ' Skip empty PLC IO values
+        If currentPLCIO <> "" Then
+            If Left(currentPLCIO, 1) = "0" Then
+                currentPLCIO = Mid(currentPLCIO, 2)
+            End If
+            If Right(currentPLCIO, 1) = "C" Then
+                commonTerminal = True
+                currentPLCIO = Left(currentPLCIO, Len(currentPLCIO) - 1)
+            End If
+            ' Try to find matching TAGAXX attributes
+            Dim foundMatch As Boolean
+            foundMatch = False
+            
+            ' Loop through possible TAGA attributes (01-99)
+            For j = 1 To 99
+                Dim tagAttrName As String
+                tagAttrName = "TAGA" & Format(j, "00")
+                
+                ' Check if this attribute exists in our dictionary
+                If plcDict.Exists(tagAttrName) Then
+                    Dim tagAttrValue As String
+                    tagAttrValue = plcDict(tagAttrName)
+                    
+                    ' Extract Y value if in IN-Y or OUT-Y format
+                    If InStr(tagAttrValue, "-") > 0 Then
+                        Dim tagParts() As String
+                        tagParts = Split(tagAttrValue, "-")
+                        
+                        ' Ensure we have at least two parts
+                        If UBound(tagParts) >= 1 Then
+                            Dim signalType As String
+                            Dim pointNumber As String
+                            
+                            signalType = tagParts(0) ' IN or OUT
+                            pointNumber = tagParts(1) ' The Y value
+                            
+                            ' If the point number matches our PLC IO value
+                            If pointNumber = currentPLCIO Then
+                                foundMatch = True
+                                
+                                ' Mark this attribute as processed
+                                If Not processedAttr.Exists(tagAttrName) Then
+                                    processedAttr.Add tagAttrName, True
+                                End If
+                                
+                                ' Update PLC IO cell with full TAGAXX value
+                                If commonTerminal Then
+                                    acTable.SetText i, plcIOColIndex, tagAttrValue & "C"
+                                Else
+                                    acTable.SetText i, plcIOColIndex, tagAttrValue
+                                End If
+                                ' Build description from DESCAXX to DESCEXX
+                                Dim fullDescription As String
+                                fullDescription = ""
+                                If commonTerminal Then
+                                    fullDescription = "ANALOG COMMON POWER TERMINAL"
+                                Else
+                                    ' Check each description attribute
+                                    Dim descLetters As String
+                                    descLetters = "ABCDE"
+                                    
+                                    For k = 1 To Len(descLetters)
+                                        Dim descAttrName As String
+                                        descAttrName = "DESC" & Mid(descLetters, k, 1) & Format(j, "00")
+                                        
+                                        If plcDict.Exists(descAttrName) Then
+                                            Dim descValue As String
+                                            descValue = plcDict(descAttrName)
+                                            
+                                            If Trim(descValue) <> "" Then
+                                                If fullDescription <> "" Then
+                                                    fullDescription = fullDescription & " "
+                                                End If
+                                                fullDescription = fullDescription & Trim(descValue)
+                                            End If
+                                        End If
+                                    Next k
+                                End If
+                                ' Update description cell
+                                acTable.SetText i, descColIndex, fullDescription
+                                
+                                Exit For ' Found our match, stop looking
+                            End If
+                        End If
+                    End If
+                End If
+            Next j
+        End If
+        
+        UpdateProgress progressFrm, "Processing row " & i & " of " & acTable.rows, _
+                        97 + (3 * i / acTable.rows)
+    Next i
+    
+    ' Delete CSV file
+    On Error Resume Next
+    Kill csvPath
+    On Error GoTo ErrorHandler
+    
+    ' Reset USERI5 flag when done
+    acDoc.SetVariable "USERI5", 0
+    
+    UpdateProgress progressFrm, "Process completed", 100
+    
+    ' Finish
+    MsgBox "Terminal Connection Table processing completed successfully.", vbInformation
+    Unload progressFrm
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "An error occurred: " & Err.Number & " - " & Err.Description, vbExclamation, "Error"
+    Unload progressFrm
+End Sub
+Sub NewTerminalConnectionTable()
+    On Error GoTo ErrorHandler
+    
+    ' Declare variables
+    Dim acDoc As AcadDocument
+    Dim origTable As AcadTable, newTable As AcadTable
+    Dim i As Long, j As Long, k As Long
+    Dim progressFrm As New progressForm
+    Dim titleText As String
+    Dim plcText As String
+    Dim resultTextArr() As String
+    Dim cellText As String
+    Dim rowsToDelete As New Collection
+    Dim mergeStart As Long
+    Dim mergeEnd As Long
+    Dim headerRow As Long
+    Dim titleRow As Long
+    Dim pickPoint(0 To 2) As Double
+    Dim insertionPoint(0 To 2) As Double
+    
+    ' Get the current document
+    Set acDoc = ThisDrawing
+    
+    ' Show progress form
+    progressFrm.show vbModeless
+    UpdateProgress progressFrm, "Starting process...", 0
+    
+    ' Show clear instructions
+    MsgBox "IMPORTANT: You will now be asked to select the terminal connection table." & vbCrLf & vbCrLf & _
+           "• Click on the TABLE BORDER (the outline of the table)" & vbCrLf & _
+           "• Do NOT click on text inside the table", _
+           vbInformation, "Select Terminal Table"
+    
+    ' Prompt user to select the table
+    On Error Resume Next
+    acDoc.Utility.GetEntity origTable, pickPoint, "Select the terminal connection table (click on table border): "
+    
+    If Err.Number <> 0 Then
+        MsgBox "Selection canceled or failed.", vbExclamation, "Selection Error"
+        Unload progressFrm
+        Exit Sub
+    End If
+    On Error GoTo ErrorHandler
+    
+    If origTable Is Nothing Then
+        MsgBox "No entity selected. Exiting macro.", vbExclamation, "Selection Error"
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Check if the selected entity is a table
+    If Not TypeOf origTable Is AcadTable Then
+        MsgBox "The selected object is not a table." & vbCrLf & vbCrLf & _
+               "Please run the macro again and click on the TABLE BORDER (outline), not on text or other objects.", _
+               vbExclamation, "Invalid Selection"
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Check table structure
+    If origTable.Columns < 4 Then
+        MsgBox "Table does not have the correct structure. It needs at least 4 columns.", vbExclamation
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Verify column headers
+    headerRow = 1 ' Assuming header is in row 1
+    titleRow = 0  ' Assuming title is in row 0
+    
+    UpdateProgress progressFrm, "Verifying table structure...", 5
+    
+    If origTable.GetText(headerRow, 0) <> "TRM. NO." Or _
+       origTable.GetText(headerRow, 1) <> "JUMPER" Or _
+       origTable.GetText(headerRow, 2) <> "WIRE" Or _
+       origTable.GetText(headerRow, 3) <> "DEVICE" Then
+        MsgBox "Table does not have the correct column headers. Expected: TRM.NO., JUMPER, WIRE, DEVICE", vbExclamation
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Get title text (terminal tagstrip number)
+    titleText = origTable.GetText(titleRow, 0)
+    resultTextArr = Split(titleText, "-")
+    plcText = resultTextArr(UBound(resultTextArr))
+    
+    ' Create a new table 10 units to the right of the original table
+    UpdateProgress progressFrm, "Creating new table...", 10
+    
+    ' Get the original table's insertion point and add 10 units to X coordinate
+    ' This is the correct insertion point calculation
+    insertionPoint(0) = origTable.insertionPoint(0) + origTable.Width + 20
+    insertionPoint(1) = origTable.insertionPoint(1)
+    insertionPoint(2) = origTable.insertionPoint(2)
+    
+    ' Create new table with same dimensions as original
+    Set newTable = acDoc.modelSpace.AddTable(insertionPoint, origTable.rows, origTable.Columns, _
+                                          origTable.GetRowHeight(0), origTable.GetColumnWidth(0))
+    
+    ' Copy table style and other properties from original table
+    On Error Resume Next
+    newTable.StyleName = origTable.StyleName
+    newTable.Layer = origTable.Layer
+    
+    ' Copy text heights for different row types
+    newTable.SetTextHeight acTitleRow, origTable.GetTextHeight(acTitleRow)
+    newTable.SetTextHeight acHeaderRow, origTable.GetTextHeight(acHeaderRow)
+    newTable.SetTextHeight acDataRow, origTable.GetTextHeight(acDataRow)
+    
+    ' Copy alignment for different row types
+    newTable.SetAlignment acTitleRow, origTable.GetAlignment(acTitleRow)
+    newTable.SetAlignment acHeaderRow, origTable.GetAlignment(acHeaderRow)
+    newTable.SetAlignment acDataRow, origTable.GetAlignment(acDataRow)
+    
+    ' Copy text styles for different row types
+    newTable.SetTextStyle acTitleRow, origTable.GetTextStyle(acTitleRow)
+    newTable.SetTextStyle acHeaderRow, origTable.GetTextStyle(acHeaderRow)
+    newTable.SetTextStyle acDataRow, origTable.GetTextStyle(acDataRow)
+    
+    ' Copy all cell content from original table to new table
+    For i = 0 To origTable.rows - 1
+        For j = 0 To origTable.Columns - 1
+            ' Set text
+            newTable.SetText i, j, origTable.GetText(i, j)
+        Next j
+    Next i
+    
+    ' Copy column widths from original table
+    For j = 0 To origTable.Columns - 1
+        newTable.SetColumnWidth j, origTable.GetColumnWidth(j)
+    Next j
+    
+    ' Copy row heights from original table
+    For i = 0 To origTable.rows - 1
+        newTable.SetRowHeight i, origTable.GetRowHeight(i)
+    Next i
+    
+    ' Copy merged cells from original table to new table
+    UpdateProgress progressFrm, "Copying merged cells...", 12
+    
+    ' Variables to store merged cell information
+    Dim minRow As Long, maxRow As Long, minCol As Long, maxCol As Long
+    Dim isMerged As Boolean
+    
+    ' Check each cell in the original table for merged cells
+    For i = 0 To origTable.rows - 1
+        For j = 0 To origTable.Columns - 1
+            ' Check if this cell is merged
+            isMerged = origTable.IsMergedCell(i, j, minRow, maxRow, minCol, maxCol)
+            
+            ' If it's merged and this is the top-left cell of the merge range
+            If isMerged And i = minRow And j = minCol Then
+                ' Apply the same merge to the new table
+                On Error Resume Next
+                newTable.MergeCells minRow, maxRow, minCol, maxCol
+                If Err.Number <> 0 Then
+                    ' Just clear any error and continue
+                    Err.Clear
+                End If
+                On Error GoTo ErrorHandler
+            End If
+        Next j
+    Next i
+    
+    ' Copy blocks from JUMPER column (column 1)
+    UpdateProgress progressFrm, "Copying blocks from JUMPER column...", 14
+
+    Dim jumpCol As Integer: jumpCol = 1  ' JUMPER column index
+    Dim blockId As LongPtr
+    Dim isBlock As Boolean
+    
+    ' Check each cell in the JUMPER column for blocks
+    For i = 0 To origTable.rows - 1
+        On Error Resume Next
+        
+        ' Get the block ID if there's a block in this cell
+        blockId = origTable.GetBlockTableRecordId(i, jumpCol)
+        ' If a block was found (blockId will be non-zero)
+        If Err.Number = 0 And blockId <> 0 Then
+            ' Set the same block in the new table's corresponding cell
+            newTable.SetMargin i, jumpCol, acCellMarginBottom Or acCellMarginTop Or acCellMarginLeft Or acCellMarginRight, 0
+            newTable.SetBlockTableRecordId i, jumpCol, blockId, False
+        End If
+        
+        Err.Clear
+        On Error GoTo ErrorHandler
+    Next i
+    
+    ' Add two new columns for DESCRIPTION and PLC IO
+    UpdateProgress progressFrm, "Adding new columns...", 15
+    
+    On Error Resume Next
+    newTable.InsertColumns newTable.Columns, origTable.GetColumnWidth(origTable.Columns - 1), 2
+    newTable.SetText headerRow, newTable.Columns - 2, "DESCRIPTION"
+    newTable.SetText headerRow, newTable.Columns - 1, "PLC IO"
+    On Error GoTo ErrorHandler
+    
+    ' Keep only rows with numeric values in TRM.NO.
+    UpdateProgress progressFrm, "Processing table...", 25
+    
+    For i = 2 To newTable.rows - 1 ' Start from row 2 (skip title and header rows)
+        cellText = Trim(newTable.GetText(i, 0)) ' TRM.NO. column
+        
+        ' Check if cell contains only numeric value
+        Dim shouldKeepRow As Boolean
+        shouldKeepRow = True
+        
+        ' Only attempt numeric check if there's actual content
+        If cellText <> "" Then
+            On Error Resume Next
+            Dim testValue As Double
+            testValue = CDbl(cellText)
+            ' If there was an error converting to number, we should delete this row
+            If Err.Number <> 0 Then
+                shouldKeepRow = False
+                Err.Clear
+            End If
+            On Error GoTo 0
+            
+            If Not shouldKeepRow Then
+                ' Add non-numeric rows to the deletion list
+                rowsToDelete.Add i
+            End If
+        End If
+        
+        UpdateProgress progressFrm, "Checking rows for numeric values: " & i & " of " & newTable.rows, _
+                        25 + (10 * i / newTable.rows)
+    Next i
+    
+    ' Delete rows with non-numeric TRM.NO. values (start from the bottom to not mess up indices)
+    Dim deletionCount As Long
+    deletionCount = rowsToDelete.Count
+    
+    If deletionCount > 0 Then
+        For i = deletionCount To 1 Step -1
+            On Error Resume Next
+            newTable.DeleteRows rowsToDelete(i), 1
+            On Error GoTo 0
+            
+            UpdateProgress progressFrm, "Deleting non-numeric rows: " & (deletionCount - i + 1) & " of " & deletionCount, _
+                            35 + (10 * (deletionCount - i + 1) / deletionCount)
+        Next i
+    End If
+    
+    ' Process device matching title text
+    UpdateProgress progressFrm, "Processing device matching title...", 45
+    
+    For i = 2 To newTable.rows - 1
+        cellText = Trim(newTable.GetText(i, 3)) ' DEVICE column
+
+        If (cellText = titleText) Or (cellText = plcText) Then
+            ' Clear WIRE and DEVICE but keep TRM.NO. and JUMPER
+            newTable.SetText i, 2, "" ' WIRE
+            newTable.SetText i, 3, "" ' DEVICE
+        End If
+        
+        UpdateProgress progressFrm, "Processing device matching: " & i & " of " & newTable.rows, _
+                        45 + (10 * i / newTable.rows)
+    Next i
+    
+    ' Move data from second row of merged cells to first row
+    UpdateProgress progressFrm, "Moving data in merged cells...", 55
+    
+    i = 2
+    While i < newTable.rows - 1
+        ' Check if current row is the start of merged cells in TRM.NO. column
+        If newTable.GetText(i, 0) <> "" Then
+            ' Find potential merge range
+            mergeStart = i
+            mergeEnd = i
+            
+            ' Look ahead for merged cells (empty TRM.NO. cells)
+            For j = i + 1 To newTable.rows - 1
+                If newTable.GetText(j, 0) = "" And newTable.GetText(j, 1) = "" Then
+                    ' Likely part of merged cells
+                    mergeEnd = j
+                Else
+                    Exit For
+                End If
+            Next j
+            
+            ' If we found merged cells
+            If mergeEnd > mergeStart Then
+                ' Process all rows in the merged range
+                For j = mergeStart + 1 To mergeEnd
+                    ' For each column (starting from WIRE which is column 2)
+                    For k = 2 To newTable.Columns - 1
+                        ' Move data if exists in secondary merged row but not in first row
+                        If newTable.GetText(j, k) <> "" And newTable.GetText(mergeStart, k) = "" Then
+                            newTable.SetText mergeStart, k, newTable.GetText(j, k)
+                            newTable.SetText j, k, ""
+                        End If
+                    Next k
+                Next j
+                
+                ' Skip to next non-merged row
+                i = mergeEnd + 1
+            Else
+                i = i + 1
+            End If
+        Else
+            i = i + 1
+        End If
+        
+        UpdateProgress progressFrm, "Processing merged cells: " & i & " of " & newTable.rows, _
+                        55 + (10 * i / newTable.rows)
+    Wend
+    
+    ' Merge rows in pairs (3-4, 5-6, 7-8, etc.)
+    UpdateProgress progressFrm, "Merging rows in columns...", 65
+    
+    ' Start from row 3 (first data row after headers)
+    Dim startRow As Long
+    startRow = 2  ' Adjust if your table has different structure
+    
+    ' Continue until we can't make any more pairs
+    While startRow + 1 < newTable.rows
+        ' For each column (starting from WIRE which is column 2)
+        For k = 2 To newTable.Columns - 1
+            ' Skip TRM. NO. and JUMPER columns (0 and 1)
+            On Error Resume Next
+            ' Merge this column for two rows at a time
+            newTable.MergeCells startRow, startRow + 1, k, k
+            If Err.Number <> 0 Then
+                ' Just clear any error and continue
+                Err.Clear
+            End If
+            On Error GoTo 0
+        Next k
+        
+        ' Move to the next pair of rows
+        startRow = startRow + 2
+        
+        UpdateProgress progressFrm, "Merging rows in columns: " & startRow & " of " & newTable.rows, _
+                    65 + (20 * startRow / newTable.rows)
+    Wend
+        
+    ' Change cell height of the header row to 60
+    UpdateProgress progressFrm, "Adjusting header row height...", 85
+    
+    On Error Resume Next
+    newTable.SetRowHeight headerRow, 60
+    On Error GoTo 0
+    
+    ' Change text direction of the header row to 270 degrees
+    UpdateProgress progressFrm, "Changing text direction of header row...", 90
+    
+    On Error Resume Next
+    For j = 0 To newTable.Columns - 1
+        ' In AutoCAD, text rotation is specified in degrees
+        newTable.SetTextRotation headerRow, j, acDegrees270
+    Next j
+    On Error GoTo 0
+
+    ' Process PLC IO column based on Wire column values
+    UpdateProgress progressFrm, "Processing PLC IO column...", 95
+    
+    Dim parts() As String
+    Dim currentWireText As String
+    Dim colPLCIO As Long
+    colPLCIO = newTable.Columns - 1  ' PLC IO column is the last column
+    
+    For i = 2 To newTable.rows - 1
+        currentWireText = Trim(newTable.GetText(i, 2)) ' Wire column
+        
+        If InStr(currentWireText, "-") > 0 Then
+            parts = Split(currentWireText, "-")
+            ' Check if the left part equals plcText (ignoring case)
+            If UCase(Trim(parts(0))) = UCase(plcText) Then
+                ' Insert the YY component (right of the dash) into the PLC IO column
+                newTable.SetText i, colPLCIO, Trim(parts(1))
+            End If
+        End If
+        If Trim(newTable.GetText(i, 3)) = plcText Then
+            ' Clear the Wire cell
+            newTable.SetText i, 2, ""
+            ' Clear the Device cell as well
+            newTable.SetText i, 3, ""
+        End If
+        UpdateProgress progressFrm, "Processing PLC IO: " & i & " of " & newTable.rows, _
+                        95 + (5 * i / newTable.rows)
+    Next i
+
+    Dim rslt
+    rslt = MsgBox("Do you want to load PLC Descriptions from another drawing", vbYesNo, "PLC Terminal Converter")
+    If rslt = vbNo Then
+        ' Set description column width to 160 units
+        newTable.SetColumnWidth newTable.Columns - 2, 160
+        
+        ' Reset USERI5 flag when done
+        acDoc.SetVariable "USERI5", 0
+        
+        ' Set active table to the new table
+        newTable.Update
+        
+        ' Zoom to see the new table
+        acDoc.Application.ZoomExtents
+        
+        UpdateProgress progressFrm, "Process completed", 100
+        
+        ' Finish
+        MsgBox "New Terminal Connection Table created successfully 20 units to the right of the original.", vbInformation
+        Unload progressFrm
+        Exit Sub
+    End If
+
+    ' Process PLC IO and Description columns using LISP function
+    UpdateProgress progressFrm, "Processing PLC IO and Description using LISP...", 95
+    
+    ' Create CSV filename based on titleText
+    Dim csvFilename As String
+    csvFilename = titleText
+    If csvFilename = "" Then
+        csvFilename = "PLCData"
+    End If
+    
+    ' Get the temp folder path
+    Dim tempFolder As String
+    tempFolder = Environ("TEMP")
+    Dim csvPath As String
+    csvPath = tempFolder & "\" & csvFilename & ".csv"
+    
+SelectCSV:
+    ' Delete existing CSV file if it exists
+    On Error Resume Next
+    If Dir(csvPath) <> "" Then
+        Kill csvPath
+    End If
+    On Error GoTo ErrorHandler
+    
+    ' Reset USERI5 flag before calling LISP function
+    acDoc.SetVariable "USERI5", 0
+    
+    ' Call the getDwgPLCAttr LISP function
+    acDoc.SendCommand "getDwgPLCAttr" & vbCr & csvFilename & vbCr
+    
+    ' Wait for initial grace period (1 second)
+    Dim startWait As Date
+    startWait = Now
+    Do While DateDiff("s", startWait, Now) < 1
+        DoEvents
+    Loop
+    
+    ' Wait for LISP function to complete by checking USERI5 flag
+    Dim maxWaitTime As Long
+    maxWaitTime = 15 ' seconds
+    Dim startTime As Date
+    startTime = Now
+    Dim flagStatus As Integer
+    
+    UpdateProgress progressFrm, "Waiting for LISP function to complete...", 96
+    
+    Do While DateDiff("s", startTime, Now) < maxWaitTime
+        ' Check the USERI5 flag
+        flagStatus = acDoc.GetVariable("USERI5")
+        
+        ' 1 = success, -1 = error, 0 = still processing
+        If flagStatus = 1 Then
+            ' Success - break out of the waiting loop
+            Exit Do
+        ElseIf flagStatus = -1 Then
+            ' Error condition from LISP
+            MsgBox "The LISP function encountered an error or found no PLC blocks.", vbExclamation
+            Unload progressFrm
+            Exit Sub
+        End If
+        
+        ' Short delay to prevent tight loop
+        startWait = Now
+        Do While DateDiff("s", startWait, Now) < 0.2 ' 0.2 second delay
+            DoEvents
+        Loop
+    Loop
+    
+    ' Check if we timed out
+    If flagStatus <> 1 Then
+        MsgBox "Error: The LISP function did not complete within the timeout period.", vbExclamation
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Verify CSV file exists
+    If Dir(csvPath) = "" Then
+        MsgBox "Error: CSV file was not created properly.", vbExclamation
+        Unload progressFrm
+        Exit Sub
+    End If
+    
+    ' Wait an additional short period to ensure file is completely written and released
+    startWait = Now
+    Do While DateDiff("s", startWait, Now) < 0.5 ' Half second grace period
+        DoEvents
+    Loop
+    
+    ' Use Dictionary object to store attribute data
+    Dim plcDict As Object
+    Set plcDict = CreateObject("Scripting.Dictionary")
+    Dim tagValue As String
+    tagValue = ""
+    
+    ' Read CSV file
+    Dim fileNum As Integer
+    fileNum = FreeFile
+    
+    ' Use error handling to make sure file is accessible
+    On Error Resume Next
+    Open csvPath For Input As #fileNum
+    If Err.Number <> 0 Then
+        MsgBox "Error accessing CSV file: " & Err.Description, vbExclamation
+        Unload progressFrm
+        Exit Sub
+    End If
+    On Error GoTo ErrorHandler
+    
+    Dim headerSkipped As Boolean
+    headerSkipped = False
+    Dim line As String
+    Dim csvparts() As String
+    
+    ' Parse the CSV line by line
+    UpdateProgress progressFrm, "Reading CSV data...", 96.5
+    
+    Do Until EOF(fileNum)
+        Line Input #fileNum, line
+        
+        ' Skip header row
+        If Not headerSkipped Then
+            headerSkipped = True
+        Else
+            ' Parse CSV properly, handling quoted fields
+            Dim fieldPos As Long
+            Dim fieldStart As Long
+            Dim inQuotes As Boolean
+            Dim fieldCount As Long
+            
+            fieldCount = 0
+            ReDim csvparts(2) ' We expect 3 fields (0-2)
+            fieldStart = 1
+            fieldPos = 1
+            inQuotes = False
+            
+            Do While fieldPos <= Len(line)
+                Dim currChar As String
+                currChar = Mid(line, fieldPos, 1)
+                
+                If currChar = """" Then
+                    ' Toggle quote state
+                    inQuotes = Not inQuotes
+                ElseIf currChar = "," And Not inQuotes Then
+                    ' Found a field delimiter
+                    Dim fieldText As String
+                    fieldText = Mid(line, fieldStart, fieldPos - fieldStart)
+                    
+                    ' Remove quotes if present
+                    If Left(fieldText, 1) = """" And Right(fieldText, 1) = """" Then
+                        fieldText = Mid(fieldText, 2, Len(fieldText) - 2)
+                    End If
+                    
+                    ' Store field
+                    If fieldCount <= 2 Then
+                        csvparts(fieldCount) = fieldText
+                    End If
+                    
+                    fieldCount = fieldCount + 1
+                    fieldStart = fieldPos + 1
+                End If
+                
+                fieldPos = fieldPos + 1
+            Loop
+            
+            ' Get the last field
+            If fieldStart <= Len(line) Then
+                fieldText = Mid(line, fieldStart)
+                
+                ' Remove quotes if present
+                If Left(fieldText, 1) = """" And Right(fieldText, 1) = """" Then
+                    fieldText = Mid(fieldText, 2, Len(fieldText) - 2)
+                End If
+                
+                ' Store field
+                If fieldCount <= 2 Then
+                    csvparts(fieldCount) = fieldText
+                End If
+            End If
+            
+            ' Process the fields if we have all three
+            If UBound(csvparts) >= 2 Then
+                Dim blockName As String
+                Dim attrName As String
+                Dim attrValue As String
+                
+                blockName = Trim(csvparts(0))
+                attrName = Trim(csvparts(1))
+                attrValue = Trim(csvparts(2))
+                
+                ' Check if this is the TAG attribute
+                If attrName = "TAG" Then
+                    tagValue = attrValue
+                End If
+                
+                ' Store in dictionary
+                If Not plcDict.Exists(attrName) Then
+                    plcDict.Add attrName, attrValue
+                End If
+            End If
+        End If
+    Loop
+    
+    Close #fileNum
+    
+    ' Verify TAG attribute matches plcText
+    If tagValue <> plcText Then
+        MsgBox "Warning: The TAG value in the CSV file (" & tagValue & ") does not match the expected value (" & plcText & ")." & vbCrLf & _
+               "Continuing with processing, but results may not be accurate.", vbExclamation
+    End If
+    
+    ' Process table rows
+    Dim descColIndex As Long
+    Dim plcIOColIndex As Long
+    
+    descColIndex = newTable.Columns - 2 ' DESCRIPTION column
+    plcIOColIndex = newTable.Columns - 1 ' PLC IO column
+    
+    ' Set description column width to 160 units
+    newTable.SetColumnWidth descColIndex, 160
+    
+    UpdateProgress progressFrm, "Updating table with PLC data...", 97
+    
+    ' Dictionary to track which attributes have been processed
+    Dim processedAttr As Object
+    Set processedAttr = CreateObject("Scripting.Dictionary")
+    
+    For i = 2 To newTable.rows - 1
+        Dim currentPLCIO As String
+        currentPLCIO = Trim(newTable.GetText(i, plcIOColIndex))
+        Dim commonTerminal As Boolean
+        commonTerminal = False
+        
+        ' Skip empty PLC IO values
+        If currentPLCIO <> "" Then
+            If Left(currentPLCIO, 1) = "0" Then
+                currentPLCIO = Mid(currentPLCIO, 2)
+            End If
+            If Right(currentPLCIO, 1) = "C" Then
+                commonTerminal = True
+                currentPLCIO = Left(currentPLCIO, Len(currentPLCIO) - 1)
+            End If
+            
+            ' Try to find matching TAGAXX attributes
+            Dim foundMatch As Boolean
+            foundMatch = False
+            
+            ' Loop through possible TAGA attributes (01-99)
+            For j = 1 To 99
+                Dim tagAttrName As String
+                tagAttrName = "TAGA" & Format(j, "00")
+                
+                ' Check if this attribute exists in our dictionary
+                If plcDict.Exists(tagAttrName) Then
+                    Dim tagAttrValue As String
+                    tagAttrValue = plcDict(tagAttrName)
+                    
+                    ' Extract Y value if in IN-Y or OUT-Y format
+                    If InStr(tagAttrValue, "-") > 0 Then
+                        Dim tagParts() As String
+                        tagParts = Split(tagAttrValue, "-")
+                        
+                        ' Ensure we have at least two parts
+                        If UBound(tagParts) >= 1 Then
+                            Dim signalType As String
+                            Dim pointNumber As String
+                            
+                            signalType = tagParts(0) ' IN or OUT
+                            pointNumber = tagParts(1) ' The Y value
+                            
+                            ' If the point number matches our PLC IO value
+                            If pointNumber = currentPLCIO Then
+                                foundMatch = True
+                                
+                                ' Mark this attribute as processed
+                                If Not processedAttr.Exists(tagAttrName) Then
+                                    processedAttr.Add tagAttrName, True
+                                End If
+                                
+                                ' Update PLC IO cell with full TAGAXX value
+                                If commonTerminal Then
+                                    newTable.SetText i, plcIOColIndex, tagAttrValue & "C"
+                                Else
+                                    newTable.SetText i, plcIOColIndex, tagAttrValue
+                                End If
+                                
+                                ' Build description from DESCAXX to DESCEXX
+                                Dim fullDescription As String
+                                fullDescription = ""
+                                If commonTerminal Then
+                                    fullDescription = "ANALOG COMMON POWER TERMINAL"
+                                Else
+                                    ' Check each description attribute
+                                    Dim descLetters As String
+                                    descLetters = "ABCDE"
+                                    
+                                    For k = 1 To Len(descLetters)
+                                        Dim descAttrName As String
+                                        descAttrName = "DESC" & Mid(descLetters, k, 1) & Format(j, "00")
+                                        
+                                        If plcDict.Exists(descAttrName) Then
+                                            Dim descValue As String
+                                            descValue = plcDict(descAttrName)
+                                            
+                                            If Trim(descValue) <> "" Then
+                                                If fullDescription <> "" Then
+                                                    fullDescription = fullDescription & " "
+                                                End If
+                                                fullDescription = fullDescription & Trim(descValue)
+                                            End If
+                                        End If
+                                    Next k
+                                End If
+                                
+                                ' Update description cell
+                                newTable.SetText i, descColIndex, fullDescription
+                                
+                                Exit For ' Found our match, stop looking
+                            End If
+                        End If
+                    End If
+                End If
+            Next j
+        End If
+        
+        UpdateProgress progressFrm, "Processing row " & i & " of " & newTable.rows, _
+                        97 + (3 * i / newTable.rows)
+    Next i
+    
+    ' Delete CSV file
+    On Error Resume Next
+    Kill csvPath
+    On Error GoTo ErrorHandler
+    
+    ' Reset USERI5 flag when done
+    acDoc.SetVariable "USERI5", 0
+    
+    ' Set active table to the new table
+    newTable.Update
+    
+    ' Zoom to see the new table
+    acDoc.Application.ZoomExtents
+    
+    UpdateProgress progressFrm, "Process completed", 100
+    
+    ' Finish
+    MsgBox "New Terminal Connection Table created successfully 20 units to the right of the original.", vbInformation
+    Unload progressFrm
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "An error occurred: " & Err.Number & " - " & Err.Description, vbExclamation, "Error"
+    Unload progressFrm
+End Sub
